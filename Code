@@ -1,0 +1,838 @@
+# **Computer Science Individual Assignment**
+##### *Oliwia Monika Leończak*
+##### *Student ID: 595644*
+
+
+
+### ------------- Importing and loading data -----------------
+
+# Import packages
+# !pip install nltk
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from collections import Counter
+import random
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+import json
+import re
+from math import comb
+import sys
+from sklearn.cluster import AgglomerativeClustering
+from collections import defaultdict
+import nltk
+nltk.download('stopwords')
+nltk.download('wordnet')
+nltk.download('punkt_tab')
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
+from itertools import combinations
+from sklearn.metrics import pairwise_distances
+from sklearn.utils import resample
+from types import MethodDescriptorType
+from hashlib import sha256
+
+# For reproducing results
+np.random.seed(123)
+
+# Load data
+jsonfile = open("TVs-all-merged.json")
+data = json.load(jsonfile)
+
+### --------------------------  Counting data ------------------------------ 
+
+total_inputs = sum(len(model_entries) for model_entries in data.values())
+total_inputs   # 1624 inputs
+
+### ------------- Create dataset for cleaning and manipulation -----------------
+
+df_list = []
+
+for model_id, details_list in data.items():
+    for details in details_list:
+        details["modelID"] = model_id
+        df_list.append(details)
+
+df = pd.DataFrame(df_list)
+df = df.drop('url', axis=1)
+
+new_data = {}  # Create an empty dictionary
+
+for index, row in df.iterrows(): # Change data to df
+    # Use the row index to ensure unique keys for each row
+    unique_key = f"{row['modelID']}_{index}"  # Combines modelID and row index
+
+    new_data[unique_key] = {
+        'modelID': row['modelID'],
+        'shop': row['shop'],
+        'featuresMap': row['featuresMap'],
+        'title': row['title']
+    }
+
+### -------------------------- Cleaning of titles -----------------------------
+
+def ID_title(new_data):
+    modelID = [product['modelID'] for product in new_data.values()]
+    title = [product['title'] for product in new_data.values()]
+    return modelID, title
+
+ID_title(new_data) # gives a good overview of the data
+
+
+# Finding potential model ID from the title, leading to an efficient potential pairs proposal
+def extract_potential_id(title, min_length):
+    title = title.replace('(', '').replace(')', '')
+    digit_including_words = ' '.join(word for word in title.split() if any(char.isdigit() for char in word)).split()
+    longest_word = max(digit_including_words, key=len, default='')
+    return longest_word if len(longest_word) >= min_length else 'None'
+
+for product in new_data.values():
+    potential_model_id = extract_potential_id(product['title'], 7)
+    print(f"Potential model ID for product: {potential_model_id}") 
+
+for key, product in new_data.items():
+    potential_model_id = extract_potential_id(product['title'], 7)
+    new_data[key]['potential_model_id'] = potential_model_id       #add the new column
+    
+
+def lowercasing(text):
+    return text.lower()
+
+def interpunction(text):
+    signs = "!@#$%^&*()_-+=~`;:.<>/\|[]?-'"
+    for j in signs:
+        if j in text:
+            text = text.replace(j, ' ')
+    return text
+
+def doublespacing(text):
+    return re.sub(r'\s+', ' ', text.strip())
+
+
+# Noticed that n-gram 'diag' is problematic and glued to other words
+def replace_diag_ngrams(text, ngram="diag"):
+    pattern = r'(\S*?)' + re.escape(ngram) + r'(\S*?)'
+    text = re.sub(pattern, r'\1 ' + ngram + r' \2', text)
+    return text
+
+def clean_unify(text):
+    cleaning = {
+        'inch': [' inches',  ' Inches', '-Inch', '-Inches',  ' inch', "\'", '\”', '\bin\b', '\"', 'inchwatt', '""'], #unify units
+        'hz': [' hz', 'Hz', ' hz.', ' Hz', 'Hz.'], #unify units
+        'diag': [' diag', 'diagonal', 'diagonally', 'diag'], #unify expression
+        ' ': ['amazon', 'neweggcom', 'best buy', 'thenerds', 'newegg com'] #remove shop names
+    }
+   
+    text = text.replace('"', 'inch')
+    for clean, patterns in cleaning.items():
+        for pattern in patterns:
+            text = re.sub(r'\b' + re.escape(pattern) + r'\b', clean, text)
+
+    text = replace_diag_ngrams(text)
+    unique_words = list(set(text.split())) 
+    text = " ".join(sorted(unique_words))
+    return text
+
+def clean_title(new_data):
+    cleaned_data = {}
+    for modelID, entries in new_data.items():
+        title = entries['title']
+        entries['title'] = lowercasing(title)
+        entries['title'] = interpunction(entries['title'])
+        entries['title'] = doublespacing(entries['title'])
+        cleaned_title = clean_unify(entries['title']).strip()  # clean the title
+        entries['title'] = cleaned_title
+        cleaned_data[modelID] = entries
+    return cleaned_data
+
+new_data = clean_title(new_data)
+    
+
+###  -------------------------- Feature occurance and merging features  ------------------------------
+
+def process_features(text):
+  return text.replace(':', '')
+
+def normalize_units(text):
+    units = {
+        'inch': [r' inches', "'", '”', 'in', ' inch', ' Inches', '-Inch', '-Inches', '"'],
+        'hz': [' hz', 'Hz', ' hz.', ' Hz', 'Hz.'],
+        'cdma': [' cd/m²', 'cdm2', ' lm', ' nit'],
+        'lb': [' lb', ' lbs.', ' pounds', 'lb', ' lbs.'],
+        'watt': [' w', ' watt', 'watt'],
+        'kg': [' kg', ' kg', ' Kg', 'KG'],
+        'p': [' p', ' p', ' i/p']
+    }
+
+    for unit, patterns in units.items():
+        for pattern in patterns:
+            text = re.sub(r'\b' + pattern + r'\b', unit, text)
+    return text
+
+def interpunction_features(text):
+    signs = "!@#$%^&*()_-+=~`;.,<>/\|[]?-'"
+    for j in signs:
+        if j in text:
+            text = text.replace(j, ' ')
+    return text
+
+def process_value(text):
+    value_replacements = [
+        ('\bwithout\b', '-'), ('\bwith\b', '+'), ('\band\b', ' '), ('\bno\b', '0'), 
+        ('\byes\b', '1'), ('\bfalse\b', '0'), ('\btrue\b', '1'), ('"', 'inch')
+    ]
+    for old, new in value_replacements:
+        text = text.replace(old, new)
+        
+    text = normalize_units(text)
+    return text.lower()
+
+
+feature_counter = Counter()
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    for feature_name in features.keys():
+        processed_feature_name = process_features(feature_name)
+        feature_counter.update([processed_feature_name])
+
+for feature, count in feature_counter.most_common():
+    print(f"{feature}: {count}")
+
+
+# Example code I used for comparing similar features in feature Map check-ups (ex. on Wi-Fi features below)
+# Can be used for any individual feature check-up 
+
+# Count features containing 'WiFi' in their name
+wifi_features = {feature for feature in feature_counter if 'Wi-Fi' in feature}
+wifi_feature_count = len(wifi_features)
+
+# Output the number of WiFi-related features and their names
+print(f"Number of Wi-Fi-related features: {wifi_feature_count}")
+print("Wi-Fi-related features:")
+for wifi_feature in sorted(wifi_features):
+    print(wifi_feature)
+
+# Merge WiFi-related features into one feature 'WiFi'
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    wifi_values = [features.pop(feature) for feature in list(features.keys()) if 'Wi-Fi' in feature]
+    if wifi_values:
+        features["Wi-Fi"] = ", ".join(sorted(set(wifi_values)))
+
+# Extract unique values and their counts for a specific feature (e.g., 'Maximum Resolution')
+feature_value_counter = Counter()
+feature_name = "Wi-Fi"
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    if feature_name in features:
+        feature_value_counter[features[feature_name]] += 1
+
+# Output unique values and counts for the specific feature
+print(f"Unique values and counts for '{feature_name}':")
+for value, count in feature_value_counter.most_common():
+    print(f"{value}: {count}")
+
+
+
+###  ------------- General merge and testing section  ----------------
+
+def merge_features(features, feature_group, merged_name):
+    if isinstance(feature_group, set):
+        values = [features.pop(feature) for feature in list(features.keys()) if any(group in feature for group in feature_group)]
+    else: 
+        values = [features.pop(feature) for feature in list(features.keys()) if feature_group in feature]
+    if values:
+        features[merged_name] = ", ".join(sorted(set(values)))
+
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    merge_features(features, 'HDMI', 'HDMI')
+    merge_features(features, 'Wi-Fi', 'Wi-Fi')
+    merge_features(features, 'Bluetooth', 'Bluetooth')
+    merge_features(features, 'USB', 'USB')
+    merge_features(features, 'Green', 'Green Compliance')
+    merge_features(features, 'Size', 'Screen Size')
+    merge_features(features, 'Weight', 'Weight')
+    merge_features(features, 'PC', 'PC Inputs')
+    merge_features(features, 'Ethernet', 'Ethernet')
+    merge_features(features, 'Internet', 'Internet Connection')
+    merge_features(features, {'Consumption', 'kWh'}, 'Power Consumption')
+    merge_features(features, 'Smart', 'Smart TV')
+    merge_features(features, {'STAR', 'Star'}, 'Energy Star Certified')
+    merge_features(features, {'Warranty Term - Parts', 'Warranty Terms - Parts'}, 'Warranty Terms - Parts')
+    merge_features(features, {'Warranty Term - Labor', 'Warranty Terms - Labor'}, 'Warranty Terms - Labor')
+    merge_features(features, 'Refresh Rate', 'Refresh Rate')
+    merge_features(features, 'Component Video', 'Component Video')
+    merge_features(features, 'Composite Video', 'Composite Video')
+    merge_features(features, 'S-Video', 'S-Video')
+    merge_features(features, 'Speakers', 'Speakers')
+    merge_features(features, 'Card', 'Card Slot')
+    merge_features(features, 'Resolution', 'Resolution')
+    merge_features(features, 'Brand', 'Brand')
+    merge_features(features, 'VESA', 'VESA')
+    merge_features(features, 'Meta', 'Meta Keywords')
+    merge_features(features, 'Headphone', 'Headphone')
+    merge_features(features, 'Width', 'Width')
+    merge_features(features, 'Date', 'Date First Available')
+    merge_features(features, {'Cabinet Color', 'Color', 'Color Name', 'Color:'}, 'Color')
+    merge_features(features, {'Color Supported:', 'Display Color'}, 'Display Color')
+    merge_features(features, {'Display Type', 'Display Technology:'}, 'Display Type')
+    merge_features(features, 'Dimensions', 'Dimensions')
+    merge_features(features, 'Feature', 'Features')
+    merge_features(features, 'Remote', 'Remote Control')
+    merge_features(features, 'Audio', 'Audio Outputs')
+    merge_features(features, 'Height', 'Height')
+    merge_features(features, 'Depth', 'Depth')
+
+    for key in features.keys():
+        if isinstance(features[key], str): 
+            features[key] = lowercasing(features[key])
+            features[key] = normalize_units(features[key])
+            features[key] = process_value(features[key])
+            features[key] = interpunction_features(features[key])
+            features[key] = doublespacing(features[key])
+
+feature_counter = Counter()
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    feature_counter.update(features.keys())
+
+# Output the results
+displayed_features_count = 0
+most_common_features = {}
+for feature, count in feature_counter.most_common():
+  if count > 300:
+    print(f"{feature}: {count}")
+    displayed_features_count += 1
+    most_common_features[feature] = [model_entry.get("featuresMap", {}).get(feature) for model_entry in new_data.values() if feature in model_entry.get("featuresMap", {})]
+
+print(f"Total features displayed: {displayed_features_count}")
+most_common_features
+
+
+### ------------------ Top 5 feature cleanup ----------------------
+
+def clean_screen_sizes(counter):
+    unified_data = defaultdict(int)
+    if isinstance(counter, str):
+        counter = Counter([counter])
+    for raw_size, count in counter.items():
+        match = re.search(r'\b(\d+(?:[.,]\d+)?)\s?(inch)?\b', raw_size)
+        if match:
+            standardized_size = f"{match.group(1).replace(',', '.')}" + "inch"
+        else:
+            standardized_size = raw_size
+        unified_data[standardized_size] += count
+    return max(unified_data, key=unified_data.get)
+
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    ss_values = [features.pop(feature) for feature in list(features.keys()) if 'Screen Size' in feature]
+    if ss_values:
+        combined_value = ", ".join(str(val) for val in ss_values)
+        standardized_value = clean_screen_sizes(combined_value)
+        if isinstance(standardized_value, set):
+            standardized_value = next(iter(standardized_value), None)
+        features["Screen Size"] = standardized_value 
+
+ss_count = Counter()
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    if "Screen Size" in features:
+        ss_count[features["Screen Size"]] += 1
+
+# Output the results
+print("Standardized Screen Size feature counts:")
+for value, count in ss_count.most_common():
+    print(f"{value}: {count}")
+    
+    
+def clean_resolutions(counter):
+    unified_data = defaultdict(int)
+    if isinstance(counter, str):
+        resolutions = [res.strip() for res in counter.split(',')]
+        counter = Counter(resolutions)
+    for raw_resolution, count in counter.items():
+        if re.search(r'\b(1080p|1920\s*x\s*1080|full\s*hd)\b', raw_resolution, re.IGNORECASE):
+            standardized_resolution = '1080p'
+        elif re.search(r'\b(720p|1280\s*x\s*720|1366\s*x\s*768)\b', raw_resolution, re.IGNORECASE):
+            standardized_resolution = '720p'
+        elif re.search(r'\b(4k|2160p|3840\s*x\s*2160)\b', raw_resolution, re.IGNORECASE):
+            standardized_resolution = '4k'
+        elif re.search(r'\b(2k|1440p|2560\s*x\s*1440)\b', raw_resolution, re.IGNORECASE):
+            standardized_resolution = '2k'
+        elif re.search(r'\b(480p|480\s*x\s*272|320\s*x\s*240)\b', raw_resolution, re.IGNORECASE):
+            standardized_resolution = '480p'
+        else:
+            standardized_resolution = raw_resolution
+        unified_data[standardized_resolution] += count
+    return max(unified_data, key=unified_data.get) if unified_data else None
+
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    res_values = [
+        features[feature]
+        for feature in list(features.keys())
+        if any(keyword in feature.lower() for keyword in ["resolution", "contrast ratio", "view angle"])
+    ]
+    if not res_values:
+        continue
+    combined_value = ", ".join(str(val) for val in res_values)
+    standardized_value = clean_resolutions(combined_value)
+    features["Resolution"] = standardized_value
+
+res_count = Counter()
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    if "Resolution" in features:
+        res_count[features["Resolution"]] += 1
+
+# Output the results
+print("\nStandardized Resolution feature counts:")
+for value, count in res_count.most_common():
+    print(f"{value}: {count}")
+
+
+def extract_weights(weight_str):
+    weights = []
+    matches = re.findall(r"(\d+(?:\.\d+)?)\s*(oz|kg|kilograms|g|grams|lb|pounds|lbs)?(?:.*)?", weight_str.lower())
+    for match in matches:
+        value, unit = match[:2] 
+        value = float(value)
+        if unit in ['oz']: 
+            value = value / 16
+        elif unit in ['kg', 'kilograms']: 
+            value = value * 2.20462
+        elif unit in ['g', 'grams']:
+            value = value * 0.0022046
+        weights.append(value)
+    if weights:
+        rounded_weight = round(weights[0] / 5) * 5  # Round to nearest 5
+        return int(rounded_weight) 
+    if not match:
+        return weight_str
+
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    weight_values = [features.pop(feature) for feature in list(features.keys()) if 'Weight' in feature]
+    if weight_values:
+        combined_value = ", ".join(str(val) for val in weight_values) 
+        standardized_value = extract_weights(combined_value)
+        if isinstance(standardized_value, set):
+            standardized_value = next(iter(standardized_value), None) 
+        features["Weight"] = standardized_value # Add to features
+
+weight_count = Counter()
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    if "Weight" in features:
+        weight_count[features["Weight"]] += 1
+
+# Output the results
+print("Standardized Weight feature counts:")
+for value, count in weight_count.most_common():
+    print(f"{value}: {count}")
+
+
+def standardize_measurements_HDMI(text):
+    HDMI_units = {
+        '5': [r'5', r'5 In'],
+        '4': [r'4', r'4 In', r'4 (Side)', r'4 (side)', r'4, HDMI 1.4, Yes', r'4, Yes', r'4 (2 Side / 2 Rear)', r'4 (w/CEC)'],
+        '3': [r'3', r'3 In', r'3 (Side)', r'3 (side)', r'3, Yes', r'3 In (side: 1, rear: 2)'],
+        '2': [r'2', r'2 In', r'2 (Side)', r'2 (side)', r'2, Yes'],
+        '1': [r'1', r'1 In', r'1 (Side)', r'1 (side)', r'1, Yes', r'1, HDMI 1.4b, Yes', 'Yes'],
+        '0': [r'0', r'No']
+    }
+    for standardized_value, patterns in HDMI_units.items():
+        for pattern in patterns:
+            if pattern in text:
+                return standardized_value
+    return ({value})
+
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    hdmi_values = [features.pop(feature) for feature in list(features.keys()) if 'HDMI' in feature]
+    if hdmi_values:
+        combined_value = ", ".join(str(val) for val in hdmi_values) 
+        standardized_value = standardize_measurements_HDMI(combined_value)
+        if isinstance(standardized_value, set):
+            standardized_value = next(iter(standardized_value), None) 
+        features["HDMI"] = standardized_value # Add to features
+
+hdmi_count = Counter()
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    if "HDMI" in features:
+        hdmi_count[features["HDMI"]] += 1
+
+# Output the results
+print("Standardized HDMI feature counts:")
+for value, count in hdmi_count.most_common():
+    print(f"{value}: {count}")
+
+
+def map_usb_value(value):
+    value = value.lower().strip()
+    if "yes" in value and "no" not in value:
+        return "Yes"
+    elif "no" in value and "yes" not in value:
+        return "No"
+    elif "no" in value and "yes" in value:
+        return "Upgrade possible"
+    match = re.match(r'^(\d+)', value)
+    if match:
+        return match.group(1)
+    else:
+        return value
+
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    usb_values = [features.pop(feature) for feature in list(features.keys()) if 'USB' in feature]
+    if usb_values:
+        combined_value = ", ".join(str(val) for val in usb_values)  
+        standardized_value = map_usb_value(combined_value)
+        if isinstance(standardized_value, set):
+            standardized_value = next(iter(standardized_value), None)
+        features["USB"] = standardized_value # Add to features
+
+usb_count = Counter()
+for model_id, model_entries in new_data.items():
+    features = model_entries.get("featuresMap", {})
+    if "USB" in features:
+        usb_count[features["USB"]] += 1
+
+# Output the results
+print("Standardized Weight feature counts:")
+for value, count in usb_count.most_common():
+    print(f"{value}: {count}")
+    
+    
+ ### ---------------------- Cleaning the rest of the features while creating key-value pairs -----------------------
+
+key_value_pairs = []
+
+for model_id, products in new_data.items(): 
+    features = products.get("featuresMap", {})
+    filtered_pairs = {}
+
+    for key, value in features.items():
+        clean_key = re.sub(r"featuresMap\.", "", key).lower()
+        clean_key = re.sub(r"[()]", "", clean_key)
+        clean_key = re.sub(r'["–:\\\\/\-]', "", clean_key).strip()
+        clean_value = str(value).lower()
+        clean_value = re.sub(r"[()]", "", clean_value)
+        clean_value = re.sub(r'["–:\\\\/\-]', "", clean_value)
+        clean_value = clean_value.replace(" na", "").strip()
+        filtered_pairs[clean_key] = clean_value
+        if key in most_common_features:
+            filtered_pairs[clean_key] = value 
+
+    key_value_pairs.append(filtered_pairs)
+    products["featuresMap"] = filtered_pairs
+
+# Output cleaned feature-value pairs
+for i, pairs in enumerate(key_value_pairs):
+    print(f"Product {i+1} {pairs}")
+
+def title(new_data):
+    title = [product['title'] for product in new_data.values()]
+    return title
+
+titles = title(new_data)
+
+### ------------------------- Data frame -----------------------------
+
+data = []
+for model_id, model_entries in new_data.items():
+    title = model_entries.get("title")
+    features_map = model_entries.get("featuresMap")
+    potential_model_id = model_entries.get('potential_model_id')
+    model_id_value = model_entries.get("modelID")
+
+    data.append({
+      'title': title,
+      'key_value_pairs': features_map,
+      'potential_model_id': potential_model_id,
+      'model_id': model_id_value
+    })
+
+df = pd.DataFrame(data)
+
+### ------------------------- Model words -----------------------------
+
+stop_words = set(stopwords.words("english"))
+lemmatizer = WordNetLemmatizer()
+
+def preprocess_text(text):
+    tokens = word_tokenize(text)
+    tokens = [lemmatizer.lemmatize(word) for word in tokens if word not in stop_words]
+    return tokens
+
+model_words = set()
+for i in range(len(titles)):
+    title_tokens = preprocess_text(titles[i])
+    features = key_value_pairs[i]
+    feature_tokens = []
+    for key, value in features.items():
+        feature_tokens += preprocess_text(key)
+        if isinstance(value, (int, float)):
+            feature_tokens.append(str(value))
+        elif isinstance(value, str):
+            feature_tokens += preprocess_text(value)
+    model_words.update(title_tokens + feature_tokens)
+model_words_list = list(model_words)
+
+# Inspect the results
+#print(f"Number of model words: {len(model_words_list)}") #4959 items
+#print(model_words_list[:20])  # Preview the first 20 words
+
+
+### ------------------------- Binary vectors -------------------------------
+
+def create_binary_vectors(products, model_words_list):
+    binary_vectors = [] 
+
+    for i in products.index:
+        vector = [0] * len(model_words_list)
+        features = products.loc[i, "key_value_pairs"]
+        title = products.loc[i, "title"]
+        features_tokens = [
+            lemmatizer.lemmatize(word.lower())
+            for word in features
+            if word.lower() not in stop_words
+        ]
+        title_tokens = [
+            lemmatizer.lemmatize(word.lower())
+            for word in word_tokenize(title)
+            if word.lower() not in stop_words
+        ]
+        all_tokens = features_tokens + title_tokens
+
+        for token in all_tokens:
+            if token in model_words_list:
+                vector[model_words_list.index(token)] = 1
+                
+        binary_vectors.append({"index": i, "modelID": products.loc[i, "model_id"], "vector": vector})
+        
+    binary_vectors_array = np.array([d['vector'] for d in binary_vectors])
+    return binary_vectors_array.T
+
+all_products = []
+for index, model_entries in new_data.iterrows(): 
+    all_products.append(model_entries.to_dict()) 
+
+binary_vectors = create_binary_vectors(new_data, model_words_list) 
+# print(binary_vectors.shape) # (4959, 1624)
+
+
+### --------------------- True and potential duplicates -----------------------
+
+def true_duplicates(dataset, key_col):
+    true_pairs = [] 
+    real_count = 0 
+    for i in range(len(dataset)):
+        for j in range(i + 1, len(dataset)):  
+            if dataset.loc[i, key_col] == dataset.loc[j, key_col]:
+                true_pairs.append((i, j))
+                real_count += 1 
+    return true_pairs, real_count
+
+true_pairs, real_count = true_duplicates(new_data, 'model_id')
+
+def potential_duplicates(dataset, key_col):
+    potential_pairs = [] 
+    real_count2 = 0 
+
+    for i in range(len(dataset)):
+        for j in range(i + 1, len(dataset)): 
+            if dataset.loc[i, key_col] == dataset.loc[j, key_col] and dataset.loc[i, key_col] != 'None':
+                potential_pairs.append((i, j))
+                real_count2 += 1
+    return potential_pairs, real_count2
+
+potential_pairs, real_count2 = potential_duplicates(new_data, 'potential_model_id') 
+
+
+### ------------------------ MinHashing and LSH --------------------------
+
+num_perm = 300  # Number of hash functions (permutations)
+threshold = 0.9  # LSH similarity threshold
+
+def minhash_signature(binary_vectors, num_perm):
+    if isinstance(binary_vectors, list):
+        binary_vectors = np.array(binary_vectors)
+    num_features, num_docs = binary_vectors.shape
+    signatures = np.full((num_perm, num_docs), np.inf) 
+    for perm in range(num_perm):
+        np.random.seed(perm)
+        permuted_indices = np.random.permutation(num_features)
+        for doc_id in range(num_docs):
+            for feature_idx in permuted_indices:
+                if binary_vectors[feature_idx, doc_id] == 1: 
+                    signatures[perm, doc_id] = feature_idx
+                    break 
+    return signatures
+
+def lsh(signatures, threshold, num_bands):
+    num_perm, num_docs = signatures.shape
+    rows_per_band = num_perm // num_bands
+    assert num_perm % num_bands == 0, "Number of permutations must be divisible by the number of bands."
+    buckets = [{} for _ in range(num_bands)] 
+    candidates = set()
+    for band in range(num_bands):
+        for doc_id in range(num_docs):
+            start = band * rows_per_band
+            end = (band + 1) * rows_per_band
+            band_signature = tuple(signatures[start:end, doc_id])
+            bucket_key = sha256(str(band_signature).encode('utf8')).hexdigest()
+            if bucket_key not in buckets[band]:
+                buckets[band][bucket_key] = []
+            buckets[band][bucket_key].append(doc_id)
+
+    for band in buckets:
+        for bucket_docs in band.values():
+            if len(bucket_docs) > 1:  
+                for i in range(len(bucket_docs)):
+                    for j in range(i + 1, len(bucket_docs)):
+                        pair = (bucket_docs[i], bucket_docs[j])
+                        
+                        # Calculate Jaccard similarity for the pair
+                        doc1 = signatures[:, pair[0]]
+                        doc2 = signatures[:, pair[1]]
+                        intersection = np.sum(doc1 == doc2)
+                        union = len(doc1)
+                        similarity = intersection / union
+                        if similarity >= threshold:
+                            candidates.add(pair)
+
+    return candidates
+
+signatures = minhash_signature(binary_vectors, num_perm)
+num_bands = 15  
+new_candidates = lsh(signatures, threshold, num_bands)
+print(f"Number of candidate pairs: {len(new_candidates)}")
+
+
+### --------------------------- MSMP ------------------------------
+
+def msmp_similarity(signatures, refined_candidates, similarity_threshold=0.9):
+    found_duplicates = set()
+    for pair in refined_candidates:
+        i, j = pair
+        # Calculate Jaccard similarity for refined candidates
+        matching_hashes = np.sum(signatures[:, i] == signatures[:, j])
+        similarity = matching_hashes / signatures.shape[0]
+        if similarity >= similarity_threshold:
+            found_duplicates.add((i, j))
+    return found_duplicates
+
+found_duplicates = msmp_similarity(signatures, refined_candidates, similarity_threshold=0.9)
+
+
+### ------------------ Bootstrap Evaluation Function with Plots ----------------------
+
+def bootstrap_evaluation(new_data, true_pairs, signatures, similarity_threshold=0.9, n_bootstraps=10):
+    pq1_scores = []
+    pq2_scores = []
+    pc1_scores = []
+    pc2_scores = []
+    f1star_1_scores = []
+    f1star_2_scores = []
+
+    f1_1_scores = []
+    f1_2_scores = []
+    precision1_scores = []
+    precision2_scores = []
+    recall1_scores = []
+    recall2_scores = []
+
+    for bootstrap_idx in range(n_bootstraps):
+        indices = list(new_data.index)
+        train_indices, test_indices = train_test_split(indices, test_size=0.37, random_state=bootstrap_idx)
+        train_data = new_data.loc[train_indices]
+        test_data = new_data.loc[test_indices]
+        test_true_pairs = set(pair for pair in true_pairs if pair[0] in test_indices and pair[1] in test_indices)
+
+        lsh_candidates = lsh(signatures, threshold=0.9, num_bands=15)
+        lsh_extended_candidates = lsh_candidates | set(potential_pairs)
+        msmp_candidates = msmp_similarity(signatures, lsh_candidates, similarity_threshold=0.9)
+        msmp_extended_candidates = msmp_similarity(signatures, lsh_extended_candidates, similarity_threshold=0.9)
+
+        correct_matches1 = len(test_true_pairs & lsh_candidates)
+        correct_matches2 = len(test_true_pairs & lsh_extended_candidates)
+
+        PQ_1 = correct_matches1 / len(lsh_candidates) if lsh_candidates else 0
+        PC_1 = correct_matches1 / len(test_true_pairs) if test_true_pairs else 0
+        F1_star_1 = (2 * PQ_1 * PC_1) / (PQ_1 + PC_1) if PQ_1 + PC_1 else 0
+
+        PQ_2 = correct_matches2 / len(lsh_extended_candidates) if lsh_extended_candidates else 0
+        PC_2 = correct_matches2 / len(test_true_pairs) if test_true_pairs else 0
+        F1_star_2 = (2 * PQ_2 * PC_2) / (PQ_2 + PC_2) if PQ_2 + PC_2 else 0
+
+
+        tp1 = len(test_true_pairs & msmp_candidates) 
+        fp1 = len(msmp_candidates - test_true_pairs)  
+        fn1 = len(test_true_pairs - msmp_candidates)  
+
+        precision1 = tp1 / (tp1 + fp1) if (tp1 + fp1) > 0 else 0
+        recall1 = tp1 / (tp1 + fn1) if (tp1 + fn1) > 0 else 0
+        f1_1 = 2 * (precision1 * recall1) / (precision1 + recall1) if (precision1 + recall1) > 0 else 0
+
+        tp2 = len(test_true_pairs & msmp_extended_candidates) 
+        fp2 = len(msmp_extended_candidates - test_true_pairs) 
+        fn2 = len(test_true_pairs - msmp_extended_candidates) 
+
+        precision2 = tp2 / (tp2 + fp2) if (tp2 + fp2) > 0 else 0
+        recall2 = tp2 / (tp2 + fn2) if (tp2 + fn2) > 0 else 0
+        f1_2 = 2 * (precision2 * recall2) / (precision2 + recall2) if (precision2 + recall2) > 0 else 0
+
+        precision1_scores.append(precision1)
+        precision2_scores.append(precision2)
+        recall1_scores.append(recall1)
+        recall2_scores.append(recall2)
+        f1_1_scores.append(f1_1)
+        f1_2_scores.append(f1_2)
+        pq1_scores.append(PQ_1)
+        pq2_scores.append(PQ_2)
+        pc1_scores.append(PC_1)
+        pc2_scores.append(PC_2)
+        f1star_1_scores.append(F1_star_1)
+        f1star_2_scores.append(F1_star_2)
+
+        print(f"Bootstrap {bootstrap_idx + 1}: Pair quality ={PQ_1:.2f}, Pair Completeness ={PC_1:.2f}, F1* ={F1_star_1:.2f} \n Pair quality extended={PQ_2:.2f}, Pair Completeness extended={PC_2:.2f}, F1* extended={F1_star_2:.2f}")
+        print(f"Bootstrap {bootstrap_idx + 1}: Precision={precision1:.2f}, Recall={recall1:.2f}, F1={f1_1:.2f} \n Precision extended={precision2:.2f}, Recall extended={recall2:.2f}, F1 extended={f1_2:.2f}")
+
+    avg_precision1 = np.mean(precision1_scores)
+    avg_recall1 = np.mean(recall1_scores)
+    avg_f1_1 = np.mean(f1_1_scores)
+    avg_precision2 = np.mean(precision2_scores)
+    avg_recall2 = np.mean(recall2_scores)
+    avg_f1_2 = np.mean(f1_2_scores)
+    avg_pq1 = np.mean(pq1_scores)
+    avg_pq2 = np.mean(pq2_scores)
+    avg_pc1 = np.mean(pc1_scores)
+    avg_pc2 = np.mean(pc2_scores)
+    avg_f1star_1 = np.mean(f1star_1_scores)
+    avg_f1star_2 = np.mean(f1star_2_scores)
+
+    print(f"\nAverage Pair Quality Across Bootstraps: {avg_pq1:.2f}")
+    print(f"Average Pair Completeness Across Bootstraps: {avg_pc1:.2f}")
+    print(f"Average F1* Across Bootstraps: {avg_f1star_1:.2f}")
+    print(f"\nAverage Precision Across Bootstraps: {avg_precision1:.2f}")
+    print(f"Average Recall Across Bootstraps: {avg_recall1:.2f}")
+    print(f"Average F1-Score Across Bootstraps: {avg_f1_1:.2f}")
+    print(f"\nAverage Extended Precision Across Bootstraps: {avg_precision2:.2f}")
+    print(f"Average Extended Recall Across Bootstraps: {avg_recall2:.2f}")
+    print(f"Average Extended F1-Score Across Bootstraps: {avg_f1_2:.2f}")
+    print(f"\nAverage Extended Pair Quality Across Bootstraps: {avg_pq2:.2f}")
+    print(f"Average Extended Pair Completeness Across Bootstraps: {avg_pc2:.2f}")
+    print(f"Average Extended F1* Across Bootstraps: {avg_f1star_2:.2f}")
+
+    return avg_pq1, avg_pc1, avg_f1star_1, avg_precision1, avg_recall1, avg_f1_1, avg_pq2, avg_pc2, avg_f1star_2, avg_precision2, avg_recall2, avg_f1_2
+
+similarity_threshold = 0.9
+num_bands = 15
+bootstrap_evaluation(new_data, true_pairs, signatures, similarity_threshold=similarity_threshold, n_bootstraps=10)
